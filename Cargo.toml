@@ -1,0 +1,19 @@
+[package]
+name = "carve"
+version = "0.0.0"
+authors = ["Daniel J Rollins <daniel@djrollins.com>"]
+description = """
+carve is a terminal-focused tool for interactively searching and exploring text
+files and logs.
+"""
+documentation = "https://github.com/djrollins/carve"
+homepage = "https://github.com/djrollins/carve"
+repository = "https://github.com/djrollins/carve"
+keywords = ["grep", "pattern", "regex", "search", "text"]
+categories = ["command-line-utilities", "text-processing"]
+license = "Apache-2.0"
+
+
+edition = "2021"
+
+[dependencies]
