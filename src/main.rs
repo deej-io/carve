@@ -1,32 +1,33 @@
+use std::fs::OpenOptions;
 use std::io::{self, IsTerminal};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::Terminal;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style, Stylize},
     text::Line,
-    widgets::{Block, Borders, List, ListItem, Paragraph},
-    Terminal,
+    widgets::{List, ListItem, Paragraph},
 };
 
 #[derive(Copy, Clone)]
 enum Mode {
-    Tail,   // Auto-scrolling mode
     Normal, // Manual scrolling and searching
+    Search, // Command/search entry
+    Filter, // Filter expression entry
 }
 
 impl Mode {
-    fn status_text(&self) -> String {
+    fn status_text(&self) -> &'static str {
         match self {
-            Mode::Tail => "TAIL".to_string(),
-            Mode::Normal => "NORMAL".to_string(),
+            Mode::Normal => "NORMAL",
+            Mode::Search => "SEARCH",
+            Mode::Filter => "FILTER",
         }
     }
 }
@@ -35,6 +36,8 @@ struct App {
     lines: Arc<Mutex<Vec<String>>>,
     scroll: usize,
     mode: Mode,
+    tailing: bool,
+    filter: String,
     search_query: String,
     current_match: usize,
     matches: Vec<(usize, usize, usize)>, // (line_index, start, end)
@@ -45,11 +48,17 @@ impl App {
         Self {
             lines: Arc::new(Mutex::new(Vec::new())),
             scroll: 0,
-            mode: Mode::Tail,
+            mode: Mode::Normal,
             search_query: String::new(),
             current_match: 0,
             matches: Vec::new(),
+            tailing: true,
+            filter: String::new(),
         }
+    }
+
+    fn scroll_to(&mut self, position: usize) {
+        self.scroll = position
     }
 
     fn scroll_up(&mut self, amount: usize) {
@@ -78,6 +87,9 @@ impl App {
                 }
             }
         }
+
+        // TODO: accept a current position and return the first search result after it so we can
+        // scroll directly to it.
     }
 
     fn next_match(&mut self) {
@@ -99,6 +111,12 @@ impl App {
             }
         }
     }
+}
+
+fn restore_terminal() -> Result<(), io::Error> {
+    disable_raw_mode()?;
+    let mut tty = OpenOptions::new().write(true).open("/dev/tty")?;
+    execute!(tty, LeaveAlternateScreen)
 }
 
 #[tokio::main]
@@ -124,83 +142,95 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Set up terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Set up terminal. We need to render directly to the tty device so we don't disrupt stderr and
+    // stdout
+    // TODO: Make this work on Windows.
+    let tty = OpenOptions::new().write(true).open("/dev/tty")?;
+    
+    // Replace panic handler to reset the terminal in case of panic.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Err(res) = restore_terminal() {
+            eprintln!("failed to restore terminal: {}", res)
+        }
+        hook(info);
+    }));
 
+    enable_raw_mode()?;
+    execute!(tty.try_clone()?, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(tty.try_clone()?);
+    let mut terminal = Terminal::new(backend)?;
 
     loop {
         terminal.draw(|frame| {
-            let size = frame.size();
+            let area = frame.area();
             // Create a temporary vector of lines while holding the lock
+            let view_height = area.height as usize;
             let items: Vec<ListItem> = app.lines
                 .lock()
                 .map(|lines| {
-                    lines.iter().enumerate().map(|(idx, line)| {
-                        let mut spans = Vec::new();
-                        let mut last_end = 0;
+                    lines.iter()
+                        .filter(|line| {
+                            app.filter == "" || line.contains(&app.filter)
+                        })
+                        .enumerate()
+                        .map(|(idx, line)| {
+                            // Only process lines that are visible in the viewport
+                            if idx < app.scroll || idx >= app.scroll + view_height {
+                                return ListItem::new(ratatui::text::Line::raw(""));
+                            }
+                            let mut spans = Vec::new();
+                            let mut last_end = 0;
 
-                        // Get all matches for this line
-                        let line_matches: Vec<_> = app.matches.iter()
-                            .enumerate()
-                            .filter(|(_, (line_idx, _, _))| *line_idx == idx)
-                            .collect();
+                            // Get all matches for this line
+                            let line_matches: Vec<_> = app.matches.iter()
+                                .enumerate()
+                                .filter(|(_, (line_idx, _, _))| *line_idx == idx)
+                                .collect();
 
-                        for (match_idx, (_, start, end)) in line_matches {
-                            // Add non-matching text before this match
-                            if last_end < *start {
+                            for (match_idx, (_, start, end)) in line_matches {
+                                // Add non-matching text before this match
+                                if last_end < *start {
+                                    spans.push(ratatui::text::Span::raw(
+                                        line[last_end..*start].to_string()
+                                    ));
+                                }
+
+                                // Add the matching text with highlight
+                                let style = if match_idx == app.current_match {
+                                    Style::default().bg(ratatui::style::Color::Yellow)
+                                        .fg(ratatui::style::Color::Black)
+                                } else {
+                                    Style::default().bg(ratatui::style::Color::DarkGray)
+                                        .fg(ratatui::style::Color::White)
+                                };
+
+                                spans.push(ratatui::text::Span::styled(
+                                    line[*start..*end].to_string(),
+                                    style,
+                                ));
+                                last_end = *end;
+                            }
+
+                            // Add remaining text after last match
+                            if last_end < line.len() {
                                 spans.push(ratatui::text::Span::raw(
-                                    line[last_end..*start].to_string()
+                                    line[last_end..].to_string()
                                 ));
                             }
 
-                            // Add the matching text with highlight
-                            let style = if match_idx == app.current_match {
-                                Style::default().bg(ratatui::style::Color::Yellow)
-                                    .fg(ratatui::style::Color::Black)
-                            } else {
-                                Style::default().bg(ratatui::style::Color::DarkGray)
-                                    .fg(ratatui::style::Color::White)
-                            };
+                            // If no matches were found, just show the plain line
+                            if spans.is_empty() {
+                                spans.push(ratatui::text::Span::raw(line.to_string()));
+                            }
 
-                            spans.push(ratatui::text::Span::styled(
-                                line[*start..*end].to_string(),
-                                style,
-                            ));
-                            last_end = *end;
-                        }
-
-                        // Add remaining text after last match
-                        if last_end < line.len() {
-                            spans.push(ratatui::text::Span::raw(
-                                line[last_end..].to_string()
-                            ));
-                        }
-
-                        // If no matches were found, just show the plain line
-                        if spans.is_empty() {
-                            spans.push(ratatui::text::Span::raw(line.to_string()));
-                        }
-
-                        ListItem::new(ratatui::text::Line::from(spans))
-                    }).collect()
+                            ListItem::new(ratatui::text::Line::from(spans))
+                        })
+                        .collect()
                 })
                 .unwrap_or_default();
 
-            let view_height = size.height as usize;
-            let total_lines = items.len();
-            let max_scroll = total_lines.saturating_sub(view_height);
-
-            // Auto-scroll to bottom if in tail mode and content doesn't fit
-            if matches!(app.mode, Mode::Tail) && total_lines > view_height {
-                app.scroll = max_scroll;
-            }
-
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title("Text Viewer"))
                 .style(Style::default())
                 .highlight_style(Style::default().bold());
 
@@ -211,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
                     Constraint::Min(1),     // Main content
                     Constraint::Length(1),  // Status bar
                 ].as_ref())
-                .split(size);
+                .split(area);
 
             // Render main content
             frame.render_stateful_widget(
@@ -222,15 +252,13 @@ async fn main() -> anyhow::Result<()> {
 
             // Render status bar
             let mode_text = format!(" {} ", app.mode.status_text());
-            let mode_style = match app.mode {
-                Mode::Tail => Style::default().bg(Color::Green).fg(Color::Black),
-                Mode::Normal => Style::default().bg(Color::Blue).fg(Color::White),
-            };
             
             let status = Line::from(vec![
-                ratatui::text::Span::styled(mode_text, mode_style),
+                ratatui::text::Span::from(mode_text),
                 if !app.search_query.is_empty() {
-                    ratatui::text::Span::raw(format!(" Search: {} ", app.search_query))
+                    ratatui::text::Span::raw(format!(" [Search: {}]", app.search_query))
+                } else if !app.filter.is_empty() {
+                    ratatui::text::Span::raw(format!(" [Filter: {}]", app.filter))
                 } else {
                     ratatui::text::Span::raw("")
                 },
@@ -247,52 +275,16 @@ async fn main() -> anyhow::Result<()> {
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match (app.mode, key.code) {
-                    // Quit works in any mode
-                    (_, KeyCode::Char('q')) => break,
+                    // Quit only works in normal mode
+                    (Mode::Normal, KeyCode::Char('q')) => break,
                     
                     // Esc always returns to tail mode
-                    (_, KeyCode::Esc) => app.mode = Mode::Tail,
-                    
-                    // In tail mode, any movement key enters normal mode
-                    (Mode::Tail, KeyCode::Char('/')) => {
-                        app.mode = Mode::Normal;
-                        app.search_query.clear();
-                    },
-                    (Mode::Tail, KeyCode::Char('j')) => {
-                        let view_height = terminal.size()?.height as usize;
-                        if app.len() > view_height {
-                            app.mode = Mode::Normal;
-                            app.scroll_down(1, app.len().saturating_sub(view_height));
-                        }
-                    },
-                    (Mode::Tail, KeyCode::Char('k')) => {
-                        let view_height = terminal.size()?.height as usize;
-                        if app.len() > view_height {
-                            app.mode = Mode::Normal;
-                            app.scroll_up(1);
-                        }
-                    },
-                    (Mode::Tail, KeyCode::Char('d')) => {
-                        let view_height = terminal.size()?.height as usize;
-                        if app.len() > view_height {
-                            app.mode = Mode::Normal;
-                            let amount = view_height / 2;
-                            app.scroll_down(amount, app.len().saturating_sub(view_height));
-                        }
-                    },
-                    (Mode::Tail, KeyCode::Char('u')) => {
-                        let view_height = terminal.size()?.height as usize;
-                        if app.len() > view_height {
-                            app.mode = Mode::Normal;
-                            let amount = view_height / 2;
-                            app.scroll_up(amount);
-                        }
-                    },
+                    (_, KeyCode::Esc) => app.mode = Mode::Normal,
                     
                     // Normal mode commands
-                    (Mode::Normal, KeyCode::Char('/')) => {
-                        app.search_query.clear();
-                    },
+                    //(Mode::Normal, KeyCode::Char('/')) => {
+                    //    app.search_query.clear();
+                    //},
                     (Mode::Normal, KeyCode::Char('n')) if !app.matches.is_empty() => app.next_match(),
                     (Mode::Normal, KeyCode::Char('N')) if !app.matches.is_empty() => app.prev_match(),
                     (Mode::Normal, KeyCode::Char('j')) => {
@@ -300,12 +292,14 @@ async fn main() -> anyhow::Result<()> {
                         if app.len() > view_height {
                             app.scroll_down(1, app.len().saturating_sub(view_height));
                         }
+                        app.tailing = false;
                     },
                     (Mode::Normal, KeyCode::Char('k')) => {
                         let view_height = terminal.size()?.height as usize;
                         if app.len() > view_height {
                             app.scroll_up(1);
                         }
+                        app.tailing = false;
                     },
                     (Mode::Normal, KeyCode::Char('d')) => {
                         let view_height = terminal.size()?.height as usize;
@@ -313,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
                             let amount = view_height / 2;
                             app.scroll_down(amount, app.len().saturating_sub(view_height));
                         }
+                        app.tailing = false;
                     },
                     (Mode::Normal, KeyCode::Char('u')) => {
                         let view_height = terminal.size()?.height as usize;
@@ -320,37 +315,68 @@ async fn main() -> anyhow::Result<()> {
                             let amount = view_height / 2;
                             app.scroll_up(amount);
                         }
+                        app.tailing = false;
+                    },
+                    (Mode::Normal, KeyCode::Char('g')) => {
+                        app.scroll_to(0);
+                        app.tailing = false;
+                    },
+                    (Mode::Normal, KeyCode::Char('G')) => {
+                        let view_height = terminal.size()?.height as usize;
+                        app.scroll_to(app.len().saturating_sub(view_height));
+                        app.tailing = true;
                     },
                     // Handle all characters in normal mode (for search)
-                    (Mode::Normal, KeyCode::Char(c)) => {
+                    (Mode::Normal, KeyCode::Char('f')) => {
+                        app.search_query.clear();
+                        app.update_search();
+                        app.mode = Mode::Search;
+                    },
+                    (Mode::Search, KeyCode::Char(c)) => {
                         app.search_query.push(c);
                         app.update_search();
                     },
-                    (Mode::Normal, KeyCode::Backspace) => {
+                    (Mode::Search, KeyCode::Backspace) => {
                         app.search_query.pop();
                         app.update_search();
                     },
-                    (Mode::Normal, KeyCode::Enter) => {
+                    (Mode::Search, KeyCode::Enter) => {
                         if !app.matches.is_empty() {
                             if let Some((line_idx, _, _)) = app.matches.get(app.current_match) {
                                 app.scroll = *line_idx;
                             }
                         }
                         app.search_query.clear();
+                        app.mode = Mode::Normal;
                     },
+                    (Mode::Normal, KeyCode::Char('/')) => {
+                        app.filter.clear();
+                        app.mode = Mode::Filter;
+                    },
+                    (Mode::Filter, KeyCode::Char(c)) => {
+                        app.filter.push(c);
+                    },
+                    (Mode::Filter, KeyCode::Backspace) => {
+                        app.filter.pop();
+                    },
+                    (Mode::Filter, KeyCode::Enter) => {
+                        app.mode = Mode::Normal;
+                    },
+                    // Handle all characters in normal mode (for search)
                     _ => {}
                 }
             }
         }
     }
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    restore_terminal()?;
 
-    // Print the text after exiting
+    // Print the filtered lines after exiting
     if let Ok(lines) = app.lines.lock() {
-        for line in lines.iter() {
+        let lines = lines.iter().filter(|line| {
+            app.filter == "" || line.contains(&app.filter)
+        });
+        for line in lines {
             println!("{}", line);
         }
     }
